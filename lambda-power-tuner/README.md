@@ -45,8 +45,13 @@ python3 lambda-power-tuner.py
 ## Output
 
 The script generates a CSV file containing memory optimization recommendations for each Lambda function in your AWS account. File contains
-- lambda function name 
-- power tuner memory recommendation link
+- Lambda Function Name 
+- Current Memory
+- Power Tuner Visualization URL
+
+| LambdaFunctionName | CurrentMemory | PowerTunerVisualizationURL |
+| --- | --- | --- |
+| TestLamdaFunction | 128 | https://lambda-power-tuning.show/#gAAAAQACAAQ=;7+6+QH6xJEDyi+U/A50WQg==;SYt8MmN3WDKXT5Ayl0+QMw== |
 
 ## Contributing
 
