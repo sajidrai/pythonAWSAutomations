@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Monitor AWS Identity Center changes and send alerts"
+
+Resources:
+  ## 🚀 Create SNS Topic
+  IdentityCenterSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: IdentityCenterAlerts
+
+  ## 🚀 Create Lambda IAM Role
+  IdentityCenterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: IdentityCenterLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IdentityCenterLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref IdentityCenterSNSTopic
+
+  ## 🚀 Create Lambda Function
+  IdentityCenterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IdentityCenterMonitor
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IdentityCenterLambdaRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref IdentityCenterSNSTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          sns_client = boto3.client("sns")
+          SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+
+          def lambda_handler(event, context):
+              try:
+                  print("Received Event:", json.dumps(event, indent=2))
+
+                  # Extract event details
+                  detail = event["detail"]
+                  event_name = detail["eventName"]
+                  event_source = detail["eventSource"]
+                  event_time = detail["eventTime"]
+                  user_identity = detail.get("userIdentity", {})
+                  request_params = detail.get("requestParameters", {})
+
+                  # Extract user info
+                  user = user_identity.get("arn", "Unknown User")
+                  ip_address = user_identity.get("sourceIPAddress", "Unknown IP")
+
+                  # Construct alert message
+                  event_summary = f"""
+                  🔹 **AWS Identity Center Change Detected**
+                  --------------------------------------------
+                  🛠 **Action**: {event_name}
+                  🔍 **Event Source**: {event_source}
+                  ⏰ **Time**: {event_time}
+                  👤 **Performed By**: {user}
+                  🌐 **IP Address**: {ip_address}
+                  📝 **Request Parameters**: {json.dumps(request_params, indent=2)}
+                  --------------------------------------------
+                  """
+
+                  # Send alert via SNS
+                  sns_client.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Subject="AWS Identity Center Alert",
+                      Message=event_summary
+                  )
+
+                  return {"status": "Success", "message": event_summary}
+
+              except Exception as e:
+                  print(f"Error processing event: {str(e)}")
+                  return {"status": "Error", "message": str(e)}
+
+  ## 🚀 Create EventBridge Rule (Enhanced)
+  IdentityCenterEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: IdentityCenterChangeRule
+      EventBusName: default
+      EventPattern:
+        detail-type: 
+          - "AWS API Call via CloudTrail"
+        source:
+          - "aws.identitystore"
+          - "aws.sso"
+          - "aws.sso-admin"
+          - "aws.sso-directory"
+        detail:
+          eventSource:
+            - "identitystore.amazonaws.com"
+            - "sso.amazonaws.com"
+            - "sso-admin.amazonaws.com"
+            - "sso-directory.amazonaws.com"
+          eventName:
+            - "AddMemberToGroup"
+            - "RemoveMemberFromGroup"
+            - "CreateUser"
+            - "UpdateUser"
+            - "DeleteUser"
+            - "CreateGroup"
+            - "UpdateGroup"
+            - "DeleteGroup"
+            - "CreatePermissionSet"
+            - "UpdatePermissionSet"
+            - "DeletePermissionSet"
+            - "AttachManagedPolicyToPermissionSet"
+            - "DetachManagedPolicyFromPermissionSet"
+            - "AssignUserToGroup"
+            - "RemoveUserFromGroup"
+            - "CreateAccountAssignment"
+            - "DeleteAccountAssignment"
+            - "UpdateInstance"
+            - "AssociateMemberToGroup"
+            - "DisassociateMemberFromGroup"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IdentityCenterLambda.Arn
+          Id: "IdentityCenterLambdaTarget"
+
+  ## 🚀 Permission for EventBridge to Invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref IdentityCenterLambda
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt IdentityCenterEventRule.Arn
+
+Outputs:
+  SNSTopicARN:
+    Description: "SNS Topic ARN for Identity Center Alerts"
+    Value: !Ref IdentityCenterSNSTopic
+  LambdaFunctionName:
+    Description: "Lambda function monitoring Identity Center changes"
+    Value: !Ref IdentityCenterLambda
+  EventBridgeRuleName:
+    Description: "EventBridge rule monitoring Identity Center changes"
+    Value: !Ref IdentityCenterEventRule
