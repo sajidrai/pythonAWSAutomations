@@ -1,0 +1,369 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation stack to automate weekly IAM Users & Groups report generation and distribution.
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store reports.
+
+  SNSTopicName:
+    Type: String
+    Description: Name of the SNS topic for notifications.
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 0 ? * MON *)"
+    Description: >-
+      CloudWatch Events schedule expression for weekly execution (default: Monday at midnight UTC)
+
+Resources:
+  IAMReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 
+        Fn::Sub: ${S3BucketName}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+
+  IAMReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: 
+        Fn::Sub: ${S3BucketName}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPublicRead
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: 
+              Fn::Sub: 'arn:aws:s3:::${S3BucketName}/*'
+
+  ReportSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: 
+        Fn::Sub: ${SNSTopicName}
+
+  IAMReportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IAMReportLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'identitystore:ListUsers'
+                  - 'identitystore:ListGroups'
+                  - 'identitystore:ListGroupMemberships'
+                  - 'sso:ListInstances'
+                Resource: '*'
+              - Effect: Allow
+                Action: 
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource: 
+                  Fn::Sub: 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: 
+                  Fn::GetAtt: [ReportSNSTopic, TopicArn]
+
+  IAMReportLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IAMReportGenerator
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: 
+        Fn::GetAtt: [IAMReportLambdaRole, Arn]
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import os
+          from datetime import datetime, timedelta
+          from io import StringIO
+          from botocore.config import Config
+          
+          def get_identity_store_id():
+              sso = boto3.client('sso-admin')
+              instances = sso.list_instances()
+              if not instances['Instances']:
+                  raise Exception("No Identity Center instance found")
+              return instances['Instances'][0]['IdentityStoreId']
+          
+          def format_table_row(columns, widths, is_header=False):
+              """Format a row for the ASCII table"""
+              separator = "│"
+              row = separator
+              for col, width in zip(columns, widths):
+                  col_str = str(col).strip()
+                  # Truncate and pad the column content
+                  if len(col_str) > width:
+                      col_str = col_str[:width-3] + "..."
+                  # Center align header, left align content
+                  if is_header:
+                      row += f" {col_str.center(width)} {separator}"
+                  else:
+                      row += f" {col_str.ljust(width)} {separator}"
+              return row
+          
+          def create_ascii_table(data, headers):
+              """Create an ASCII table from the data"""
+              # Define column widths - reduced widths for more concise layout
+              widths = [25, 35, 40]  # Username, Email, Groups
+              
+              # Create the table components with single space padding
+              top_border    = "┌" + "─" * (widths[0] + 2) + "┬" + "─" * (widths[1] + 2) + "┬" + "─" * (widths[2] + 2) + "┐"
+              header_border = "├" + "━" * (widths[0] + 2) + "┿" + "━" * (widths[1] + 2) + "┿" + "━" * (widths[2] + 2) + "┤"
+              row_border    = "├" + "─" * (widths[0] + 2) + "┼" + "─" * (widths[1] + 2) + "┼" + "─" * (widths[2] + 2) + "┤"
+              bottom_border = "└" + "─" * (widths[0] + 2) + "┴" + "─" * (widths[1] + 2) + "┴" + "─" * (widths[2] + 2) + "┘"
+              
+              # Build the table
+              table = [
+                  top_border,
+                  format_table_row(headers, widths, True),
+                  header_border
+              ]
+              
+              # Add data rows with alternating background (if supported by email client)
+              for i, row in enumerate(data):
+                  table.append(format_table_row(row, widths))
+                  if i < len(data) - 1:
+                      table.append(row_border)
+                  else:
+                      table.append(bottom_border)
+              
+              return "\n".join(table)
+          
+          def format_date(date_str):
+              """Format date string to be more readable"""
+              dt = datetime.strptime(date_str, "%Y%m%d")
+              return dt.strftime("%B %d, %Y")
+          
+          def lambda_handler(event, context):
+              s3_config = Config(
+                  signature_version='s3v4',
+                  region_name='us-east-2'  # Replace with your region
+              )
+              s3 = boto3.client('s3', config=s3_config)
+              sns = boto3.client('sns')
+              
+              try:
+                  identity_store_id = get_identity_store_id()
+                  identity_store = boto3.client('identitystore')
+                  
+                  # Get all users
+                  users = []
+                  paginator = identity_store.get_paginator('list_users')
+                  for page in paginator.paginate(IdentityStoreId=identity_store_id):
+                      users.extend(page['Users'])
+                  
+                  # Get all groups
+                  groups = []
+                  paginator = identity_store.get_paginator('list_groups')
+                  for page in paginator.paginate(IdentityStoreId=identity_store_id):
+                      groups.extend(page['Groups'])
+                  
+                  # Create a mapping of group memberships
+                  user_groups = {}
+                  for user in users:
+                      user_groups[user['UserId']] = []
+                  
+                  # Get group memberships for each group
+                  for group in groups:
+                      paginator = identity_store.get_paginator('list_group_memberships')
+                      for page in paginator.paginate(
+                          IdentityStoreId=identity_store_id,
+                          GroupId=group['GroupId']
+                      ):
+                          for membership in page['GroupMemberships']:
+                              user_id = membership['MemberId']['UserId']
+                              if user_id in user_groups:
+                                  user_groups[user_id].append(group['DisplayName'])
+                  
+                  # Prepare data for table and CSV
+                  table_data = []
+                  csv_data = []
+                  headers = ['User Name', 'Email', 'Groups']
+                  
+                  for user in users:
+                      user_id = user['UserId']
+                      email = next((attr['Value'] for attr in user.get('Emails', []) if attr.get('Primary', False)), 'No Email')
+                      groups_str = ', '.join(user_groups.get(user_id, ['No Groups']))
+                      
+                      row = [user['UserName'], email, groups_str]
+                      table_data.append(row)
+                      csv_data.append(row)
+                  
+                  # Sort users by username
+                  table_data.sort(key=lambda x: x[0].lower())
+                  
+                  # Create ASCII table
+                  table = create_ascii_table(table_data, headers)
+                  
+                  current_date = datetime.utcnow().strftime("%Y%m%d")
+                  formatted_date = format_date(current_date)
+                  
+                  # Create CSV file
+                  csv_buffer = StringIO()
+                  writer = csv.writer(csv_buffer)
+                  writer.writerow(headers)
+                  writer.writerows(csv_data)
+                  
+                  file_name = f'AWS_IAM_Identity_Center_Report_{current_date}.csv'
+                  bucket_name = os.environ['S3_BUCKET_NAME']
+                  
+                  # Upload CSV to S3
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=file_name,
+                      Body=csv_buffer.getvalue(),
+                      ContentType='text/csv'
+                  )
+                  
+                  s3_console_url = f"https://s3.console.aws.amazon.com/s3/object/{bucket_name}/{file_name}"
+                  
+                  # Format message with proper spacing and structure
+                  message = (
+                      "AWS IAM Identity Center Report\n"
+                      "══════════════════════════════\n"
+                      "\n"
+                      f"• CSV Report download link: {s3_console_url}\n"
+                      "• Report Retention: 90 days\n"
+                      "• Access: Requires AWS Console login\n"
+                      "\n"
+                      "📊 SUMMARY\n"
+                      "─────────\n"
+                      f"• Report Generated: {formatted_date}\n"
+                      f"• Total Users: {len(users)}\n"
+                      f"• Total Groups: {len(groups)}\n"
+                      "\n"
+                      "👥 USER AND GROUP DETAILS\n"
+                      "────────────────────────\n"
+                      f"{table}\n"
+                      "\n"
+                      "Note: This is an automated report generated from AWS IAM Identity Center.\n"
+                      "For any questions or issues, please contact your AWS administrator."
+                  )
+                  
+                  sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Message=message,
+                      Subject=f'AWS IAM Identity Center Report - {formatted_date}'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Report generated and notification sent successfully!')
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: 
+            Fn::Sub: ${S3BucketName}
+          SNS_TOPIC_ARN: 
+            Fn::GetAtt: [ReportSNSTopic, TopicArn]
+
+  WeeklyTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger IAM Report Lambda function weekly"
+      ScheduleExpression: 
+        Fn::Sub: ${ScheduleExpression}
+      State: ENABLED
+      Targets:
+        - Arn: 
+            Fn::GetAtt: [IAMReportLambda, Arn]
+          Id: "TriggerIAMReportLambda"
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: 
+        Fn::GetAtt: [IAMReportLambda, Arn]
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: [WeeklyTriggerRule, Arn]
+
+Outputs:
+  S3Bucket:
+    Description: "S3 Bucket storing IAM reports"
+    Value: 
+      Fn::Sub: ${S3BucketName}
+    Export:
+      Name: 
+        Fn::Sub: "${AWS::StackName}-S3BucketName"
+
+  S3BucketArn:
+    Description: "ARN of S3 Bucket storing IAM reports"
+    Value:
+      Fn::GetAtt: [IAMReportsBucket, Arn]
+    Export:
+      Name:
+        Fn::Sub: "${AWS::StackName}-S3BucketArn"
+
+  SNSTopic:
+    Description: "SNS Topic for notifications"
+    Value: 
+      Fn::GetAtt: [ReportSNSTopic, TopicArn]
+    Export:
+      Name:
+        Fn::Sub: "${AWS::StackName}-SNSTopicArn"
+
+  SNSTopicName:
+    Description: "Name of the SNS Topic"
+    Value:
+      Fn::Sub: ${SNSTopicName}
+    Export:
+      Name:
+        Fn::Sub: "${AWS::StackName}-SNSTopicName"
+
+  LambdaFunction:
+    Description: "IAM Report Generator Lambda function"
+    Value: 
+      Fn::GetAtt: [IAMReportLambda, Arn]
+    Export:
+      Name:
+        Fn::Sub: "${AWS::StackName}-LambdaFunctionArn"
+
+  LambdaFunctionName:
+    Description: "Name of the Lambda function"
+    Value: "IAMReportGenerator"
+    Export:
+      Name:
+        Fn::Sub: "${AWS::StackName}-LambdaFunctionName"
+
+  ScheduleExpression:
+    Description: "Schedule for report generation"
+    Value: 
+      Fn::Sub: ${ScheduleExpression}
+    Export:
+      Name:
+        Fn::Sub: "${AWS::StackName}-ScheduleExpression"
