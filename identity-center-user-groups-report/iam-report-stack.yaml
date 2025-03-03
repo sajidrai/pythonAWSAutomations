@@ -22,6 +22,11 @@ Resources:
     Properties:
       BucketName: 
         Fn::Sub: ${S3BucketName}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
       VersioningConfiguration:
         Status: Enabled
       LifecycleConfiguration:
